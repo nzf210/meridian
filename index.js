@@ -350,6 +350,13 @@ export async function runManagementCycle({ silent = false } = {}) {
         ].filter(Boolean).join("\n");
       }).join("\n\n");
 
+      let closeAttempted = false;
+      let closeSucceeded = false;
+      let closeFailureReason = null;
+      let claimAttempted = false;
+      let claimSucceeded = false;
+      let claimFailureReason = null;
+
       const { content } = await agentLoop(`
 MANAGEMENT ACTION REQUIRED — ${actionPositions.length} position(s)
 
@@ -364,11 +371,37 @@ RULES:
 Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
-        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+        onToolStart: async ({ name }) => {
+          if (name === "close_position") closeAttempted = true;
+          if (name === "claim_fees") claimAttempted = true;
+          await liveMessage?.toolStart(name);
+        },
+        onToolFinish: async ({ name, result, success }) => {
+          if (name === "close_position") {
+            closeAttempted = true;
+            closeSucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (!closeSucceeded) {
+              closeFailureReason = result?.reason || result?.error || "Unknown error";
+            }
+          }
+          if (name === "claim_fees") {
+            claimAttempted = true;
+            claimSucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (!claimSucceeded) {
+              claimFailureReason = result?.reason || result?.error || "Unknown error";
+            }
+          }
+          await liveMessage?.toolFinish(name, result, success);
+        },
       });
 
       mgmtReport += `\n\n${content}`;
+      if (closeAttempted && !closeSucceeded) {
+        mgmtReport += `\n\n⚠️ **System Warning:** A close position action was attempted but failed/was blocked: ${closeFailureReason || "Unknown error"}. The position is STILL open.`;
+      }
+      if (claimAttempted && !claimSucceeded) {
+        mgmtReport += `\n\n⚠️ **System Warning:** A claim fees action was attempted but failed/was blocked: ${claimFailureReason || "Unknown error"}.`;
+      }
     } else {
       log("cron", "Management: all positions STAY — skipping LLM");
       await liveMessage?.note("No tool actions needed.");
@@ -635,6 +668,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     let deployAttempted = false;
     let deploySucceeded = false;
+    let deployFailureReason = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -715,24 +749,81 @@ IMPORTANT:
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (!deploySucceeded) {
+              deployFailureReason = result?.reason || result?.error || "Unknown error";
+            }
           }
           await liveMessage?.toolFinish(name, result, success);
         },
       });
     screenReport = content;
-    if (/⛔\s*NO DEPLOY/i.test(content)) {
+
+    if (!deploySucceeded) {
+      const containsDeployed = /🚀\s*DEPLOYED/i.test(screenReport);
+      const containsNoDeploy = /⛔\s*NO DEPLOY/i.test(screenReport);
+      
+      if (containsDeployed || !containsNoDeploy) {
+        log("warn", "LLM hallucinated a successful deployment or failed to format NO DEPLOY. Overriding report.");
+        
+        // Extract candidate name from hallucinated report if possible
+        const lines = screenReport.split("\n");
+        let candidateName = "";
+        for (const line of lines) {
+          const match = line.match(/\*\*([^*]+)\*\*/);
+          if (match) {
+            candidateName = match[1].trim();
+            break;
+          }
+        }
+        if (!candidateName) {
+          const matchName = screenReport.match(/🚀\s*DEPLOYED\s*\n+\s*([^\n]+)/i);
+          if (matchName) {
+            candidateName = matchName[1].trim();
+          }
+        }
+        if (!candidateName && passing.length > 0) {
+          candidateName = passing[0].pool?.name || "Unknown Candidate";
+        }
+
+        const whySkipped = deployAttempted 
+          ? `Deployment failed or was blocked: ${deployFailureReason || "safety check or execution error"}.`
+          : "No valid pools qualified for deployment safety thresholds.";
+
+        screenReport = [
+          "⛔ NO DEPLOY",
+          "",
+          "Cycle finished with no valid entry.",
+          "",
+          "BEST LOOKING CANDIDATE",
+          candidateName || "None",
+          "",
+          "WHY SKIPPED",
+          whySkipped,
+        ].join("\n");
+      }
+    } else if (deploySucceeded) {
+      const containsDeployed = /🚀\s*DEPLOYED/i.test(screenReport);
+      const containsNoDeploy = /⛔\s*NO DEPLOY/i.test(screenReport);
+      
+      if (containsNoDeploy || !containsDeployed) {
+        log("warn", "LLM hallucinated NO DEPLOY or failed to format DEPLOYED despite success. Overriding report.");
+        screenReport = `🚀 DEPLOYED (System Overridden due to successful deployment)\n\n` + screenReport.replace(/⛔\s*NO DEPLOY/gi, "");
+      }
+    }
+
+    if (/⛔\s*NO DEPLOY/i.test(screenReport)) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     } else if (!deploySucceeded) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     }
   } catch (error) {
