@@ -1188,11 +1188,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     const positions = [];
     for (const pool of pools) {
       for (const positionAddress of (pool.listPositions || [])) {
-        const tracked = getTrackedPosition(positionAddress);
-        const isOOR = pool.outOfRange || pool.positionsOutOfRange?.includes(positionAddress);
-
-        if (isOOR) markOutOfRange(positionAddress);
-        else markInRange(positionAddress);
+        let tracked = getTrackedPosition(positionAddress);
 
         // Bin data: from supplemental PnL call (OOR) or tracked state (in-range)
         const binData = binDataByPool[pool.poolAddress]?.[positionAddress];
@@ -1203,6 +1199,35 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         const upperBin  = binData?.upperBinId      ?? tracked?.bin_range?.max ?? null;
         const activeBin = binData?.poolActiveBinId ?? tracked?.bin_range?.active ?? null;
         const lpData = lpAgentByPosition[positionAddress] || null;
+
+        if (!tracked) {
+          log("state", `Auto-tracking discovered on-chain position: ${positionAddress} in pool ${pool.poolAddress}`);
+          const initValUsd = lpData
+            ? safeNum(lpData.value)
+            : binData
+              ? parseFloat(config.management.solMode ? (binData.valueSol || 0) * (pool.solPrice || 80) : (binData.valueUsd || 0))
+              : 0;
+          trackPosition({
+            position: positionAddress,
+            pool: pool.poolAddress,
+            pool_name: `${pool.tokenX}-${pool.tokenY}`,
+            strategy: "spot",
+            bin_range: { min: lowerBin, max: upperBin },
+            amount_sol: config.management.solMode ? (lpData ? safeNum(lpData.valueNative) : 0) : 0,
+            amount_x: 0,
+            active_bin: activeBin,
+            bin_step: pool.binStep,
+            volatility: 0,
+            fee_tvl_ratio: 0,
+            organic_score: 0,
+            initial_value_usd: initValUsd,
+          });
+          tracked = getTrackedPosition(positionAddress);
+        }
+
+        const isOOR = pool.outOfRange || pool.positionsOutOfRange?.includes(positionAddress);
+        if (isOOR) markOutOfRange(positionAddress);
+        else markInRange(positionAddress);
 
         const ageFromState = tracked?.deployed_at
           ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
